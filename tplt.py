@@ -1,3 +1,4 @@
+import subprocess
 from argparse import ArgumentParser
 from os import environ as env
 from pathlib import Path
@@ -44,7 +45,7 @@ def new(path, template, **kwargs):
     print(template)
 
 
-def init(path, template, instance, **kwargs):
+def init(path, template, instance, run, **kwargs):
     path = ensure_path(path)
 
     template = Repo(path.joinpath(template))
@@ -52,8 +53,22 @@ def init(path, template, instance, **kwargs):
     instance = Path.cwd().joinpath(instance)
     ensure_no_path(instance)
 
-    template.clone(instance)
+    template.clone(instance, multi_options=['--origin tplt'])
     print(instance)
+
+    init = instance.joinpath(".tplt/init")
+    if init.exists():
+        if not run:
+            res = input(f"Init file found at {init}, run? [y/n] ")
+            if res.lower() == "y":
+                run = True
+
+        if run:
+            print(f"Running script {init}")
+            subprocess.run(str(init))
+
+def query(**kwargs):
+    print("Query")
 
 
 DIR = Path(env.get("XDG_TEMPLATES_DIR", "~/Templates"))\
@@ -83,7 +98,17 @@ sub_new.set_defaults(func=new)
 sub_init = sub.add_parser("init", help="Initialize a template")
 sub_init.add_argument("template", help="Name of template to use")
 sub_init.add_argument("instance", help="Path to clone template")
+sub_init.add_argument(
+    "--run",
+    "-r",
+    help="Run init script after cloning",
+    action="store_true"
+)
 sub_init.set_defaults(func=init)
+
+sub_query = sub.add_parser("query", help="Query information from the user")
+sub_query.set_defaults(func=query)
+
 
 def main():
     args = parser.parse_args()
@@ -92,6 +117,7 @@ def main():
         print(args.path)
     else:
         args.func(**args.__dict__)
+
 
 if __name__ == "__main__":
     main()
