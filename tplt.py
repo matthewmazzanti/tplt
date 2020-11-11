@@ -5,6 +5,7 @@ from argparse import ArgumentParser
 from os import environ as env
 from pathlib import Path
 from sys import exit
+from fileinput import FileInput
 
 from git import Repo, GitCommandError
 
@@ -59,6 +60,12 @@ def exclude_iterdir(path, excludes=None):
 
     return None
 
+
+def input_bool(question):
+    # Ask a question. Return true if y false otherwise
+    return input(f"{question} [y/n] ").lower() == "y"
+
+
 def default(**kwargs):
     exit("No command specified")
 
@@ -67,8 +74,13 @@ def ls(path, **kwargs):
     path = ensure_dir(path)
 
     print("Available templates:\n")
-    for sub_path in path.iterdir():
+    for sub_path in path.glob("*"):
         print(sub_path.name)
+
+
+def add_ls(subparser):
+    sub_ls = subparser.add_parser("ls", help="List available templates")
+    sub_ls.set_defaults(func=ls)
 
 
 def new(path, template, **kwargs):
@@ -81,23 +93,29 @@ def new(path, template, **kwargs):
     print(template)
 
 
-def init(path, template, name, run, **kwargs):
-    path = ensure_dir(path)
+def add_new(subparser):
+    sub = subparser.add_parser("new", help="Create new template")
+    sub.add_argument("template", help="Name of new template to create")
+    sub.set_defaults(func=new)
 
+
+def init(path, template, name, run, commit, **kwargs):
+    # Find the template to clone from
+    path = ensure_dir(path)
     template = Repo(path.joinpath(template))
 
+    # Find path to clone, make sure nothing is there
     instance = Path.cwd().joinpath(name)
     ensure_no_path(instance)
 
+    # Clone the repo, set the origin to tplt
     repo = template.clone(instance, multi_options=['--origin tplt'])
-    print(instance)
 
+    # Run init script, if available
     init = instance.joinpath(".tplt/init")
     if init.exists():
-        if not run:
-            res = input(f"Init file found at {init}, run? [y/n] ")
-            if res.lower() == "y":
-                run = True
+        if run is None:
+            run = input_bool(f"Init file found at {init}, run?")
 
         if run:
             print(f"Running script {init}")
@@ -111,26 +129,101 @@ def init(path, template, name, run, **kwargs):
                 }
             )
 
+    # If init makes, changes, ask to commit them
+    if repo.is_dirty():
+        if commit is None:
+            commit = input_bool("Init script made changes, commit them?")
+
+        if commit:
+            repo.git.add(A=True)
+            repo.git.commit(m="tmpl initial commit")
+
+
+def add_init(subparser):
+    sub = subparser.add_parser("init", help="Initialize a template")
+
+    # Required args
+    sub.add_argument("template", help="Name of template to use")
+    sub.add_argument("name", help="Name of directory to clone into")
+
+    # Flags
+    sub.add_argument(
+        "--run", "-r",
+        help="Run init script after cloning",
+        action="store_const",
+        const=True,
+        default=None
+    )
+    sub.add_argument(
+        "--no-run",
+        help="Do not run init script after cloning",
+        action="store_const",
+        const=False,
+        dest="run"
+    )
+
+    sub.add_argument(
+        "--commit", "-c",
+        help="Commit changes after init script",
+        action="store_const",
+        const=True,
+        default=None
+    )
+    sub.add_argument(
+        "--no-commit",
+        help="Do not commit changes after init script",
+        action="store_const",
+        const=False,
+        dest="commit"
+    )
+
+    sub.set_defaults(func=init)
+
 
 def query(output, question=None, default=None, **kwargs):
     if not question and not answer:
         exit("No questions or answers specified")
 
-    out_path = Path(output).absolute()
-    if out_path.exists():
+    # Ensure that nothing exists at save location
+    out = Path(output).absolute()
+    if out.exists():
         exit(f"{output} already exists!")
 
+    # Split up questions/answers on "=".
     questions = eq_split(question)
     answers = dict(eq_split(default))
+
+    # Ask questions, save to answer dict
     for name, question in questions:
         res = input(f"{question}: ")
-        if res != "":
-            answers[name] = res
+        answers[name] = res
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.touch()
-    with open(out_path, "w") as f:
+    # Write anser dict to out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.touch()
+    with open(out, "w") as f:
         f.write(json.dumps(answers, indent=4))
+
+
+def add_query(subparser):
+    sub = subparser.add_parser("query", help="Query information from the user")
+
+    sub.add_argument(
+        "--question", "-q",
+        help="Key/value pair of name/question",
+        action="append"
+    )
+    sub.add_argument(
+        "--default", "-d",
+        help="Set a default for a question",
+        action="append"
+    )
+    sub.add_argument(
+        "--output", "-o",
+        help="Where to output query results",
+        default=".tplt/query.json"
+    )
+    sub.set_defaults(func=query)
 
 
 def replace(query, delim, exclude, **kwargs):
@@ -138,74 +231,78 @@ def replace(query, delim, exclude, **kwargs):
     with open(query) as f:
         query = json.load(f)
 
-    print(query)
-
-    # https://stackoverflow.com/questions/6116978/how-to-replace-multiple-substrings-of-a-string
-    query = dict((re.escape(f"{delim}{k}{delim}"), v) for k, v in query.items())
+    # Create a dict of escaped parameters and their replacements
+    query = { re.escape(f"{delim}{k}{delim}"): v for k, v in query.items() }
 
     # Create a single regex to run over input
     pattern = re.compile("|".join(query.keys()))
+
     # Function to find replacement from a match
     repl = lambda m: query[re.escape(m.group(0))]
 
-    # (text, num) = pattern.subn(repl, text)
+    # Find all appropriate paths to replace
+    paths = exclude_iterdir(Path.cwd(), ["**/.git", "**/.tplt", *exclude])
 
-    for path in exclude_iterdir(Path.cwd(), ["**/.git", "**/.tplt", *exclude]):
-        with open(path, "rw") as f:
-            pass
+    # Use stdout redirection to replace files with fileinput
+    with FileInput(files=paths, inplace=True) as f:
+        for line in f:
+            (newline, num) = pattern.subn(repl, line)
+            print(newline if num > 0 else line, end="")
 
-        print(path)
+
+def add_replace(subparser):
+    sub = subparser.add_parser(
+        "replace",
+        help="Replace strings with queried information"
+    )
+
+    sub.add_argument(
+        "--query", "-q",
+        help="Path to json infomation to replace",
+        default=".tplt/query.json"
+    )
+    sub.add_argument(
+        "--delim", "-d",
+        help="Delimiter to use to mark templates",
+        default="&&"
+    )
+    sub.add_argument(
+        "--exclude", "-e",
+        help="File globs to exclude",
+        action="append",
+        default=[]
+    )
+
+    sub.set_defaults(func=replace)
 
 
-DIR = Path(env.get("XDG_TEMPLATES_DIR", "~/Templates"))\
-    .expanduser()\
-    .joinpath("tplt")
+def build_parser():
+    DIR = Path(env.get("XDG_TEMPLATES_DIR", "~/Templates"))\
+        .expanduser()\
+        .joinpath("tplt")
 
-parser = ArgumentParser(prog="tplt")
-parser.add_argument("--path", "-p", help="Path to templates", default=DIR)
-parser.add_argument(
-    "--where",
-    "-w",
-    help="Print path to templates",
-    action="store_true",
-    default=False
-)
-parser.set_defaults(func=default)
+    parser = ArgumentParser(prog="tplt")
+    parser.add_argument("--path", "-p", help="Path to templates", default=DIR)
+    parser.add_argument(
+        "--where", "-w",
+        help="Print path to templates",
+        action="store_true",
+        default=False
+    )
+    parser.set_defaults(func=default)
 
-sub = parser.add_subparsers()
+    subparser = parser.add_subparsers()
+    add_ls(subparser)
+    add_new(subparser)
+    add_init(subparser)
+    add_query(subparser)
+    add_replace(subparser)
 
-sub_ls = sub.add_parser("ls", help="List available templates")
-sub_ls.set_defaults(func=ls)
+    return parser
 
-sub_new = sub.add_parser("new", help="Create new template")
-sub_new.add_argument("template", help="Name of new template to create")
-sub_new.set_defaults(func=new)
-
-sub_init = sub.add_parser("init", help="Initialize a template")
-sub_init.add_argument("template", help="Name of template to use")
-sub_init.add_argument("name", help="Name of directory to clone into")
-sub_init.add_argument(
-    "--run",
-    "-r",
-    help="Run init script after cloning",
-    action="store_true"
-)
-sub_init.set_defaults(func=init)
-
-sub_query = sub.add_parser("query", help="Query information from the user")
-sub_query.add_argument("--question", "-q", help="Key/value pair of name/question", action="append")
-sub_query.add_argument("--default", "-d", help="Set a default for a question", action="append")
-sub_query.add_argument("--output", "-o", help="Where to output query results", default=".tplt/query.json")
-sub_query.set_defaults(func=query)
-
-sub_replace = sub.add_parser("replace", help="Replace strings with queried information")
-sub_replace.add_argument("--query", "-q", help="Path to json infomation to replace", default=".tplt/query.json")
-sub_replace.add_argument("--delim", "-d", help="Delimiter to use to mark templates", default="&&")
-sub_replace.add_argument("--exclude", "-e", help="File globs to exclude", action="append")
-sub_replace.set_defaults(func=replace)
 
 def main():
-    args = parser.parse_args()
+    args = build_parser().parse_args()
 
     if args.where:
         print(args.path)
